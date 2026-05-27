@@ -60,10 +60,14 @@ export default function App() {
   }
 
   const refreshLookups = async () => {
-    const [templateData, userData] = await Promise.all([
-      apiRequest('/tech-stacks', { token }),
-      apiRequest('/users', { token }),
-    ])
+    const templateData = await apiRequest('/tech-stacks', { token })
+    let userData = []
+    try {
+      userData = await apiRequest('/users', { token })
+    } catch {
+      const me = await apiRequest('/users/me', { token })
+      userData = [{ id: me.id, name: me.name, email: me.email, role: me.role }]
+    }
     setTemplates(templateData)
     setUsers(userData)
     if (templateData.length && !assignTemplateId) setAssignTemplateId(String(templateData[0].id))
