@@ -8,7 +8,7 @@ async function api(path, method = 'GET', token, body) {
     method,
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { Authorization: `****** } : {}),
+      ...(token ? { Authorization: 'Bearer ' + token } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
   })

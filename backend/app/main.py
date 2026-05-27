@@ -110,8 +110,10 @@ def create_module(
     db: Session = Depends(get_db),
     user: User = Depends(require_roles(UserRole.MANAGER, UserRole.TRAINER, UserRole.ADMIN)),
 ):
-    if payload.prerequisite_id == payload.title:
-        raise HTTPException(status_code=400, detail="Invalid prerequisite")
+    if payload.prerequisite_id is not None:
+        prerequisite = db.query(TrainingModule).filter(TrainingModule.id == payload.prerequisite_id).first()
+        if not prerequisite:
+            raise HTTPException(status_code=404, detail="Prerequisite module not found")
     module = TrainingModule(
         title=payload.title,
         description=payload.description,
