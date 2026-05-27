@@ -7,11 +7,12 @@ from sqlalchemy.orm import Session
 
 from .database import SessionLocal
 from .models import User, UserRole
+from .settings import settings
 
-SECRET_KEY = "local-dev-secret-key"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24
-COMPANY_DOMAIN = "company.com"
+SECRET_KEY = settings.jwt_secret_key
+ALGORITHM = settings.jwt_algorithm
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.access_token_expire_minutes
+COMPANY_DOMAIN = settings.company_domain
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 

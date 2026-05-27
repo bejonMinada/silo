@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime,
     Enum as SQLEnum,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -51,6 +52,7 @@ class User(Base):
 
 class TrainingModule(Base):
     __tablename__ = "training_modules"
+    __table_args__ = (Index("ix_training_modules_created_by_id", "created_by_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String(255), index=True)
@@ -63,6 +65,10 @@ class TrainingModule(Base):
 
 class Schedule(Base):
     __tablename__ = "schedules"
+    __table_args__ = (
+        Index("ix_schedules_start_time", "start_time"),
+        Index("ix_schedules_module_id_start_time", "module_id", "start_time"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     module_id: Mapped[int] = mapped_column(ForeignKey("training_modules.id"))
@@ -74,7 +80,11 @@ class Schedule(Base):
 
 class Enrollment(Base):
     __tablename__ = "enrollments"
-    __table_args__ = (UniqueConstraint("user_id", "module_id", name="uq_user_module"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "module_id", name="uq_user_module"),
+        Index("ix_enrollments_user_status", "user_id", "status"),
+        Index("ix_enrollments_module_id", "module_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
@@ -86,6 +96,10 @@ class Enrollment(Base):
 
 class SkillsInventory(Base):
     __tablename__ = "skills_inventory"
+    __table_args__ = (
+        Index("ix_skills_inventory_user_skill", "user_id", "skill_name"),
+        Index("ix_skills_inventory_user_verified", "user_id", "is_verified"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
@@ -99,6 +113,10 @@ class SkillsInventory(Base):
 
 class Documentation(Base):
     __tablename__ = "documentation"
+    __table_args__ = (
+        Index("ix_documentation_needs_review_flag", "needs_review_flag"),
+        Index("ix_documentation_author_id", "author_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String(255))
@@ -110,7 +128,10 @@ class Documentation(Base):
 
 class ScheduleRSVP(Base):
     __tablename__ = "schedule_rsvps"
-    __table_args__ = (UniqueConstraint("schedule_id", "user_id", name="uq_schedule_user"),)
+    __table_args__ = (
+        UniqueConstraint("schedule_id", "user_id", name="uq_schedule_user"),
+        Index("ix_schedule_rsvps_user_id", "user_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     schedule_id: Mapped[int] = mapped_column(ForeignKey("schedules.id"))
@@ -128,6 +149,10 @@ class TechStackTemplate(Base):
 
 class TechStackSkill(Base):
     __tablename__ = "tech_stack_skills"
+    __table_args__ = (
+        Index("ix_tech_stack_skills_template_id", "template_id"),
+        UniqueConstraint("template_id", "skill_name", name="uq_template_skill_name"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     template_id: Mapped[int] = mapped_column(ForeignKey("tech_stack_templates.id"))
@@ -137,6 +162,10 @@ class TechStackSkill(Base):
 
 class UserTechStack(Base):
     __tablename__ = "user_tech_stacks"
+    __table_args__ = (
+        Index("ix_user_tech_stacks_user_id", "user_id"),
+        UniqueConstraint("user_id", "template_id", name="uq_user_template_assignment"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))

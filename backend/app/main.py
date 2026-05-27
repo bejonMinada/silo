@@ -1,7 +1,14 @@
+import logging
+import time
+import uuid
+from collections import defaultdict, deque
 from datetime import datetime
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.responses import PlainTextResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -38,10 +45,140 @@ from .schemas import (
     TrainingModuleCreate,
     UserOut,
 )
+from .settings import settings
 
-Base.metadata.create_all(bind=engine)
+logger = logging.getLogger("silo.api")
+logging.basicConfig(
+    level=logging.DEBUG if settings.debug else logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
-app = FastAPI(title="Silo API")
+
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        request.state.request_id = request_id
+        start = time.monotonic()
+        response = await call_next(request)
+        duration_ms = round((time.monotonic() - start) * 1000, 2)
+        response.headers["x-request-id"] = request_id
+        logger.info(
+            "request.completed",
+            extra={
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+            },
+        )
+        return response
+
+
+class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > settings.max_request_body_bytes:
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "error": {
+                                "code": "request_too_large",
+                                "message": "Request body exceeds allowed size",
+                                "request_id": getattr(request.state, "request_id", None),
+                            }
+                        },
+                    )
+            except ValueError:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "code": "invalid_content_length",
+                            "message": "Invalid Content-Length header",
+                            "request_id": getattr(request.state, "request_id", None),
+                        }
+                    }
+                )
+        return await call_next(request)
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    _buckets: dict[str, deque[float]] = defaultdict(deque)
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in {"/api/health", "/api/ready"}:
+            return await call_next(request)
+
+        now = time.time()
+        key = f"{request.client.host}:{request.url.path}" if request.client else request.url.path
+        bucket = self._buckets[key]
+        window_start = now - settings.rate_limit_window_seconds
+        while bucket and bucket[0] < window_start:
+            bucket.popleft()
+        if len(bucket) >= settings.rate_limit_requests_per_minute:
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "error": {
+                        "code": "rate_limit_exceeded",
+                        "message": "Too many requests",
+                        "request_id": getattr(request.state, "request_id", None),
+                    }
+                },
+            )
+        bucket.append(now)
+        return await call_next(request)
+
+
+app = FastAPI(title="Silo API", debug=settings.debug)
+app.add_middleware(RequestContextMiddleware)
+app.add_middleware(RequestSizeLimitMiddleware)
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_allowed_origins if settings.cors_allowed_origins else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def startup():
+    if settings.create_schema_on_startup:
+        Base.metadata.create_all(bind=engine)
+        logger.info("schema.auto_created_on_startup")
+    else:
+        logger.info("schema.auto_create_disabled_expect_migrations")
+
+
+def _error_payload(request: Request, code: str, message: str):
+    return {
+        "error": {
+            "code": code,
+            "message": message,
+            "request_id": getattr(request.state, "request_id", None),
+        }
+    }
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    code = str(exc.status_code)
+    if isinstance(exc.detail, str):
+        message = exc.detail
+    else:
+        message = "Request failed"
+    return JSONResponse(status_code=exc.status_code, content=_error_payload(request, code, message))
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("request.unhandled_exception", exc_info=exc)
+    return JSONResponse(status_code=500, content=_error_payload(request, "internal_error", "Internal server error"))
 
 
 def _validate_prerequisite(db: Session, user_id: int, module_id: int) -> None:
@@ -63,9 +200,26 @@ def _validate_prerequisite(db: Session, user_id: int, module_id: int) -> None:
         raise HTTPException(status_code=400, detail="Prerequisite module must be completed first")
 
 
+def _audit(event: str, actor: User | None, metadata: dict | None = None) -> None:
+    logger.info(
+        "audit.event",
+        extra={
+            "event": event,
+            "actor_id": actor.id if actor else None,
+            "actor_role": actor.role.value if actor else None,
+            "metadata": metadata or {},
+        },
+    )
+
+
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "env": settings.app_env}
+
+
+@app.get("/api/ready")
+def ready():
+    return {"status": "ready", "database": "configured"}
 
 
 @app.post("/api/auth/login", response_model=TokenResponse)
@@ -93,7 +247,7 @@ def set_role(
     user_id: int,
     payload: RoleUpdateRequest,
     db: Session = Depends(get_db),
-    _: User = Depends(require_roles(UserRole.ADMIN)),
+    actor: User = Depends(require_roles(UserRole.ADMIN)),
 ):
     target = db.query(User).filter(User.id == user_id).first()
     if not target:
@@ -101,6 +255,7 @@ def set_role(
     target.role = payload.role
     db.commit()
     db.refresh(target)
+    _audit("user.role_updated", actor=actor, metadata={"target_user_id": user_id, "new_role": payload.role.value})
     return target
 
 
@@ -274,6 +429,7 @@ def verify_skill(
     skill.verified_by_id = user.id
     db.commit()
     db.refresh(skill)
+    _audit("skill.verified", actor=user, metadata={"skill_id": skill.id, "owner_user_id": skill.user_id})
     return skill
 
 
@@ -433,11 +589,19 @@ def assign_tech_stack(
     db.add(assignment)
     db.commit()
     db.refresh(assignment)
+    _audit(
+        "tech_stack.assigned",
+        actor=user,
+        metadata={"template_id": template_id, "target_user_id": payload.user_id},
+    )
     return assignment
 
 
 @app.get("/api/users/{user_id}/gap-analysis")
-def gap_analysis(user_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+def gap_analysis(user_id: int, db: Session = Depends(get_db), requester: User = Depends(get_current_user)):
+    if requester.role not in {UserRole.ADMIN, UserRole.MANAGER, UserRole.TRAINER} and requester.id != user_id:
+        raise HTTPException(status_code=403, detail="You may only view your own gap analysis")
+
     assignments = db.query(UserTechStack).filter(UserTechStack.user_id == user_id).all()
     if not assignments:
         return {"user_id": user_id, "assigned_templates": [], "analysis": []}
@@ -503,8 +667,28 @@ def gap_analysis(user_id: int, db: Session = Depends(get_db), _: User = Depends(
     return {"user_id": user_id, "assigned_templates": templates, "analysis": analysis}
 
 
+@app.get("/api/users")
+def list_users(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_roles(UserRole.MANAGER, UserRole.TRAINER, UserRole.ADMIN)),
+):
+    users = db.query(User).order_by(User.id.asc()).all()
+    return [{"id": u.id, "name": u.name, "email": u.email, "role": u.role.value} for u in users]
+
+
+@app.get("/api/tech-stacks")
+def list_tech_stacks(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    templates = db.query(TechStackTemplate).order_by(TechStackTemplate.id.asc()).all()
+    return [{"id": t.id, "name": t.name, "description": t.description} for t in templates]
+
+
 @app.get("/api/seed")
-def seed_admin(db: Session = Depends(get_db)):
+def seed_admin(
+    db: Session = Depends(get_db),
+    requester: User = Depends(require_roles(UserRole.ADMIN)),
+):
+    if not settings.enable_seed_endpoint:
+        raise HTTPException(status_code=404, detail="Not found")
     admin = db.query(User).filter(User.email == f"admin@{COMPANY_DOMAIN}").first()
     if not admin:
         admin = User(email=f"admin@{COMPANY_DOMAIN}", name="Admin", role=UserRole.ADMIN)
@@ -512,4 +696,5 @@ def seed_admin(db: Session = Depends(get_db)):
         db.commit()
         db.refresh(admin)
     trainers = db.query(User).filter(User.role == UserRole.TRAINER).count()
+    _audit("seed.invoked", actor=requester, metadata={"admin_id": admin.id, "trainer_count": trainers})
     return {"admin_id": admin.id, "trainer_count": trainers}
